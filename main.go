@@ -1,13 +1,10 @@
 // Command visitedlink helps reading chromium Visited Links.
-//
-//  Usage:
-//  visitedlink <Visited Link file> urls...
-// Prints each url on stdout if visited or else on stderr.
 package main
 
 import (
 	"crypto/md5"
 	"encoding/binary"
+	"flag"
 	"fmt"
 	"io"
 	"log"
@@ -15,11 +12,17 @@ import (
 	"path"
 )
 
-const fileSignature int32 = 0x6b6e4c56
-const fileVersion int32 = 3
-const headerSize int32 = 24
+const (
+	fileSignature int32 = 0x6b6e4c56
+	fileVersion   int32 = 3
+	headerSize    int32 = 24
+)
 
-var hash = md5.New()
+var (
+	visitedFile = flag.String("visited", "Visited Links", "path to the 'Visited Links' file")
+	link        = flag.String("link", "", "link to check")
+	update      = flag.Bool("update", false, "set (un)visited if not")
+)
 
 type fileHeader struct {
 	Signature int32
@@ -29,50 +32,64 @@ type fileHeader struct {
 	Salt      [8]uint8
 }
 
-func main() {
+func init() {
 	log.SetFlags(0)
+	log.SetPrefix(os.Args[0] + ": ")
+}
 
-	if len(os.Args) < 3 {
-		log.Println(`Usage:
-	visitedlink <Visited Link file> urls...
+func main() {
+	flag.Parse()
 
-Prints each url on stdout if visited or else on stderr.`)
-		os.Exit(2)
-	}
-
-	// open file
-	name := path.Clean(os.Args[1])
-	file, err := os.Open(name)
+	file, err := openFile()
 	if err != nil {
-		log.Fatalf("Unable to open %q: %v", name, err)
+		log.Fatalf("Error: %v", err)
 	}
-	defer file.Close()
+	defer func() {
+		err := file.Close()
+		if err != nil {
+			log.Fatalf("Error: %v", err)
+		}
+	}()
 
 	// read header
-	header := new(fileHeader)
-	err = binary.Read(file, binary.LittleEndian, header)
+	header, err := readHeader(file)
 	if err != nil {
-		log.Fatalf("Unable to read %q: %v", name, err)
+		log.Fatalf("Error: %v", err)
 	}
 
-	// verify header
-	err = verifyHeader(file, header)
-	if err != nil {
-		log.Fatalf("Bad header: %v", err)
-	}
+	// fingerprint
+	fp := fingerprint(*link, header.Salt)
+	fpm := modulo(fp, header.Length)
 
-	// search for urls
-	for i := 2; i < len(os.Args); i++ {
-		url := os.Args[i]
-		fp := fingerprint(url, header.Salt)
-		fpm := modulo(fp, header.Length)
-
-		if isVisited(file, fp, fpm) {
-			fmt.Println(url)
-		} else {
-			log.Println(url)
+	// update
+	if *update {
+		if err := updateValue(file, fp, fpm); err != nil {
+			log.Fatalf("Error: %v", err)
 		}
 	}
+
+	// visited link ?
+	visited := readValue(file, fp, fpm)
+	fmt.Printf("%t\n", visited)
+}
+
+func openFile() (*os.File, error) {
+	name := path.Clean(*visitedFile)
+	if *update {
+		return os.OpenFile(name, os.O_RDWR|os.O_SYNC, 0600)
+	}
+	return os.Open(name)
+}
+
+func readHeader(file *os.File) (*fileHeader, error) {
+	header := new(fileHeader)
+	if err := binary.Read(file, binary.LittleEndian, header); err != nil {
+		return nil, err
+	}
+	if err := verifyHeader(file, header); err != nil {
+		return nil, err
+	}
+	return header, nil
 }
 
 func verifyHeader(file *os.File, header *fileHeader) error {
@@ -85,47 +102,21 @@ func verifyHeader(file *os.File, header *fileHeader) error {
 
 	stat, err := file.Stat()
 	if err != nil {
-		return fmt.Errorf("unable to stat: %v", err)
+		return err
 	}
-
 	size := int64(header.Length*8 + headerSize)
 	if stat.Size() != size {
-		return fmt.Errorf("bad file size: %x, want: %x", stat.Size(), size)
+		return fmt.Errorf("bad file size: %d, want: %d", stat.Size(), size)
 	}
-
 	return nil
 }
 
-func isVisited(file io.ReadSeeker, fp uint64, fpm int32) bool {
-	pos := headerSize + fpm*8
-	_, err := file.Seek(int64(pos), io.SeekStart)
-	if err != nil {
-		return false
-	}
-
-	var fpc uint64
-	for {
-		err = binary.Read(file, binary.LittleEndian, &fpc)
-		if err != nil {
-			return false
-		}
-
-		if fpc == 0 {
-			break
-		} else if fpc == fp {
-			return true
-		}
-	}
-
-	return false
-}
-
-func fingerprint(url string, salt [8]uint8) uint64 {
-	hash.Reset()
+func fingerprint(link string, salt [8]uint8) uint64 {
+	hash := md5.New()
 
 	// ignore errors as hash/Hash.Writer never returns an error
 	hash.Write(salt[:])
-	hash.Write([]byte(url))
+	hash.Write([]byte(link))
 
 	// sum is [16]byte
 	sum := hash.Sum(nil)
@@ -137,4 +128,62 @@ func fingerprint(url string, salt [8]uint8) uint64 {
 func modulo(fp uint64, length int32) int32 {
 	v := fp % uint64(length)
 	return int32(v)
+}
+
+func readValue(file io.ReadSeeker, fp uint64, fpm int32) bool {
+	var pos = headerSize + fpm*8
+
+	_, err := file.Seek(int64(pos), io.SeekStart)
+	if err != nil {
+		return false
+	}
+
+	for {
+		var fpc uint64
+		err = binary.Read(file, binary.LittleEndian, &fpc)
+		if err != nil {
+			return false
+		}
+		if fpc == 0 {
+			break
+		} else if fpc == fp {
+			return true
+		}
+	}
+
+	return false
+}
+
+func updateValue(file *os.File, fp uint64, fpm int32) error {
+	var pos = headerSize + fpm*8
+
+	_, err := file.Seek(int64(pos), io.SeekStart)
+	if err != nil {
+		return err
+	}
+
+	write := func(value uint64) error {
+		_, err := file.Seek(int64(pos), io.SeekStart)
+		if err != nil {
+			return err
+		}
+		err = binary.Write(file, binary.LittleEndian, value)
+		if err != nil {
+			return err
+		}
+		return file.Sync()
+	}
+
+	for {
+		var fpc uint64
+		err = binary.Read(file, binary.LittleEndian, &fpc)
+		if err != nil {
+			return err
+		}
+		if fpc == 0 {
+			return write(fp)
+		} else if fpc == fp {
+			return write(uint64(0))
+		}
+	}
 }
